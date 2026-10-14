@@ -109,13 +109,25 @@ class EventSearch extends OsecBaseClass
         $where_parameters  = $this->getPostStatusSql();
         $post_status_where = $where_parameters['post_status_where'];
 
+        $extension_scope = $this->getExtensionSqlScope('relative', [
+            'time'        => $time,
+            'limit'       => $limit,
+            'page_offset' => $page_offset,
+            'last_day'    => $last_day,
+            'unique'      => (bool) $unique,
+        ]);
+
         // Get the Join (filter_join) and Where (filter_where) statements based
         // on $filter elements specified
         $filter = $this->getFilterSql($filter);
 
-        // Query arguments
-        $args = [$time];
-        $args = array_merge($args, $where_parameters['args']);
+        // Extension JOIN placeholders come before the native search arguments.
+        $args = array_merge(
+            $extension_scope['join_args'],
+            [$time],
+            $where_parameters['args'],
+            $extension_scope['where_args']
+        );
 
         if ($page_offset >= 0) {
             $first_record = $page_offset * $limit;
@@ -148,7 +160,7 @@ class EventSearch extends OsecBaseClass
                 $order_direction    = 'ASC';
             }
             $filter_date_clause .= ' %d ';
-            $args[0]            = $last_day;
+            $args[count($extension_scope['join_args'])] = $last_day;
             $first_record       = 0;
         }
         $query = $this->db->prepare(
@@ -167,11 +179,13 @@ class EventSearch extends OsecBaseClass
             $wpml_join_particle .
             'INNER JOIN ' . $this->db->get_table_name(OSEC_DB__INSTANCES) . ' i ON e.post_id = i.post_id ' .
             $filter['filter_join'] .
+            $extension_scope['join'] .
             "WHERE post_type = '" . OSEC_POST_TYPE . "' " .
             'AND ' . $filter_date_clause .
             $wpml_where_particle .
             $filter['filter_where'] .
             $post_status_where .
+            $extension_scope['where'] .
             ($unique ? 'GROUP BY e.post_id ' : '') .
             // Reverse order when viewing negative pages, to get correct set of
             // records. Then reverse results later to order them properly.
@@ -218,12 +232,19 @@ class EventSearch extends OsecBaseClass
                 $wpml_join_particle .
                 'INNER JOIN ' . $this->db->get_table_name(OSEC_DB__INSTANCES) . ' i ON e.post_id = i.post_id ' .
                 $filter['filter_join'] .
+                $extension_scope['join'] .
                 "WHERE post_type = '" . OSEC_POST_TYPE . "' " .
                 $wpml_where_particle .
                 $filter['filter_where'] .
-                $post_status_where;
-            $prev = $this->has_instance($visible, $where_parameters['args'], 'i.start < %d', $date_first);
-            $next = $this->has_instance($visible, $where_parameters['args'], 'i.start > %d', $date_last);
+                $post_status_where .
+                $extension_scope['where'];
+            $navigation_args = array_merge(
+                $extension_scope['join_args'],
+                $where_parameters['args'],
+                $extension_scope['where_args']
+            );
+            $prev = $this->has_instance($visible, $navigation_args, 'i.start < %d', $date_first);
+            $next = $this->has_instance($visible, $navigation_args, 'i.start > %d', $date_last);
         }
 
         return [
@@ -542,7 +563,15 @@ class EventSearch extends OsecBaseClass
 
         // Get the Join (filter_join) and Where (filter_where) statements based
         // on $filter elements specified
+        $extension_scope = $this->getExtensionSqlScope('between', [
+            'start'      => $start->format_to_gmt(),
+            'end'        => $end->format_to_gmt(),
+            'spanning'   => (bool) $spanning,
+            'single_day' => (bool) $single_day,
+        ]);
+
         $filter = $this->getFilterSql($filter);
+        $args = array_merge($extension_scope['join_args'], $args, $extension_scope['where_args']);
 
         $localization_helper = WpmlHelper::factory($this->app);
 
@@ -604,6 +633,7 @@ class EventSearch extends OsecBaseClass
 					' . $this->db->get_table_name(OSEC_DB__INSTANCES) . ' i
 					ON ( `e`.`post_id` = `i`.`post_id` )
 				' . $filter['filter_join'] . '
+				' . $extension_scope['join'] . '
 			WHERE
 				post_type = \'' . OSEC_POST_TYPE . '\'
 				' . $wpml_where_particle . '
@@ -611,6 +641,7 @@ class EventSearch extends OsecBaseClass
 				' . $spanning_string . '
 				' . $filter['filter_where'] . '
 				' . $post_status_where . '
+				' . $extension_scope['where'] . '
 			GROUP BY
 				`i`.`id`
 			ORDER BY
@@ -798,6 +829,83 @@ class EventSearch extends OsecBaseClass
         }
 
         return new Event($this->app, $post_id, $instance_id);
+    }
+
+    /**
+     * Apply the optional, parameterized SQL scope supplied by extensions.
+     * Invalid results fail closed so malformed visibility adapters cannot widen results.
+     *
+     * @param  string  $query_type  Search path: `relative` (including prev/next) or `between`.
+     * @param  array   $context  Scalar search options for the selected path.
+     * @return array{join: string, join_args: array, where: string, where_args: array}
+     */
+    private function getExtensionSqlScope(string $query_type, array $context): array
+    {
+        /**
+         * Filter parameterized SQL clauses added to event searches before ordering and pagination.
+         *
+         * Return `join`, `join_args`, `where`, and `where_args`. Use `%d`, `%f`, or `%s` placeholders;
+         * `where` must begin with an `AND` condition. Join arguments are prepared before native
+         * search arguments, and where arguments after them. The `relative` scope is also applied to
+         * previous/next navigation checks. Malformed return values hide all matching events.
+         *
+         * @since 1.2.0
+         *
+         * @param array  $scope       Default SQL scope.
+         * @param string $query_type `relative` (including navigation) or `between`.
+         * @param array  $context    Scalar search options for this query.
+         */
+        $scope = apply_filters('osec_event_search_sql_scope', [
+            'join'       => '',
+            'join_args'  => [],
+            'where'      => '',
+            'where_args' => [],
+        ], $query_type, $context);
+
+        if (
+            !is_array($scope)
+            || !isset($scope['join'], $scope['join_args'], $scope['where'], $scope['where_args'])
+            || !is_string($scope['join'])
+            || !is_string($scope['where'])
+            || !is_array($scope['join_args'])
+            || !array_is_list($scope['join_args'])
+            || !is_array($scope['where_args'])
+            || !array_is_list($scope['where_args'])
+            || ('' !== trim($scope['where']) && 1 !== preg_match('/^\s*AND\b/i', $scope['where']))
+            || !self::scopePlaceholdersMatch($scope['join'], $scope['join_args'])
+            || !self::scopePlaceholdersMatch($scope['where'], $scope['where_args'])
+        ) {
+            return ['join' => '', 'join_args' => [], 'where' => ' AND 1 = 0 ', 'where_args' => []];
+        }
+
+        foreach (array_merge($scope['join_args'], $scope['where_args']) as $argument) {
+            if (!is_string($argument) && !is_int($argument) && !is_float($argument)) {
+                return ['join' => '', 'join_args' => [], 'where' => ' AND 1 = 0 ', 'where_args' => []];
+            }
+        }
+
+        return [
+            'join'       => $scope['join'],
+            'join_args'  => $scope['join_args'],
+            'where'      => $scope['where'],
+            'where_args' => $scope['where_args'],
+        ];
+    }
+
+    /**
+     * Ensure extension SQL uses only supported placeholders and has matching values.
+     *
+     * @param string $sql SQL fragment.
+     * @param array  $arguments Values for the fragment's placeholders.
+     */
+    private static function scopePlaceholdersMatch(string $sql, array $arguments): bool
+    {
+        if (1 === preg_match('/(?<!%)%(?![%dfs])/', $sql)) {
+            return false;
+        }
+
+        preg_match_all('/(?<!%)%[dfs]/', $sql, $matches);
+        return count($matches[0]) === count($arguments);
     }
 
     /**
