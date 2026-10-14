@@ -158,6 +158,31 @@ class EventSearchSqlScopeTest extends TestBase
         }
     }
 
+    public function test_scope_unsupported_placeholder_fails_closed()
+    {
+        global $osec_app, $wpdb;
+
+        $this->create_event('Must be hidden by unsupported placeholder', '2030-06-15 12:00:00');
+        $scope = static fn(): array => [
+            'join'       => '',
+            'join_args'  => [],
+            'where'      => ' AND p.ID = %i ',
+            'where_args' => [1],
+        ];
+        add_filter('osec_event_search_sql_scope', $scope, 10, 3);
+
+        try {
+            $events = EventSearch::factory($osec_app)->get_events_between(
+                new DT('2030-06-01 00:00:00', 'UTC'),
+                new DT('2030-06-30 23:59:59', 'UTC')
+            );
+            $this->assertSame([], $events);
+            $this->assertSame('', $wpdb->last_error);
+        } finally {
+            remove_filter('osec_event_search_sql_scope', $scope, 10);
+        }
+    }
+
     private function create_event(string $title, string $start): int
     {
         global $osec_app;
